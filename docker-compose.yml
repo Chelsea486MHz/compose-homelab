@@ -1,0 +1,405 @@
+---
+networks:
+  network_proxy_private: # Used by the proxy's db
+  network_proxy: # Used by the reverse proxy to reach the services
+  network_grafana: # Used by Grafana to reach Prometheus
+  network_prometheus: # Used by Prometheus to reach node_exporter
+  network_paperless: # Used by Paperless-NGX
+  network_hedgedoc: # Used by Hedgedoc to communicate with its db
+  network_manyfold: # Used by Manyfold to reach its db
+  network_authentik: # For Authentik, its DB and Redis instance
+
+services:
+  # Fail2Ban
+  # Keeps the infrastructure safe
+  fail2ban:
+    container_name: fail2ban
+    image: lscr.io/linuxserver/fail2ban:latest
+    restart: always
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    environment:
+      - PUID=${UID_FAIL2BAN}
+      - PGID=${GID_FAIL2BAN}
+      - TZ=${INFRA_TIMEZONE}
+      - VERBOSITY=-vv #optional
+    volumes:
+      - /var/log:/var/log:ro
+
+  # Portainer, used to manage Docker
+  # Runs on port 9443
+  portainer:
+    container_name: portainer
+    image: portainer/portainer-ce:latest
+    restart: always
+    depends_on:
+      - proxy
+    volumes:
+      - ${INFRA_DIR}/data_portainer:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - network_proxy
+    environment:
+      PUID: ${UID_PORTAINER}
+      PGID: ${GID_PORTAINER}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Node Exporter, used to collect system metrics
+  # Runs on port 9100
+  node-exporter:
+    container_name: node-exporter
+    image: quay.io/prometheus/node-exporter:latest
+    restart: always
+    command:
+      - '--path.rootfs=/host'
+    pid: host
+    volumes:
+      - '/:/host:ro,rslave'
+    networks:
+      - network_prometheus
+    environment:
+      PUID: ${UID_NODE_EXPORTER}
+      PGID: ${GID_NODE_EXPORTER}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Prometheus scraping server
+  # Runs on port 9090
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus
+    restart: always
+    depends_on:
+      - node-exporter
+    volumes:
+      - ${INFRA_DIR}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - network_prometheus
+      - network_grafana
+    environment:
+      PUID: ${UID_PROMETHEUS}
+      PGID: ${GID_PROMETHEUS}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Manyfold, 3D model repo
+  # Listens on 3214
+  manyfold:
+    container_name: manyfold
+    image: lscr.io/linuxserver/manyfold:latest
+    restart: always
+    depends_on:
+      - proxy
+      - manyfold-redis
+      - manyfold-db
+    volumes:
+      - ${INFRA_DIR}/data_manyfold:/config
+      - ${INFRA_DIR}/CAD:/libraries
+    networks:
+      - network_proxy
+      - network_manyfold
+    environment:
+      PUID: ${UID_MANYFOLD}
+      GUID: ${GID_MANYFOLD}
+      TZ: ${INFRA_TIMEZONE}
+      DATABASE_URL: mysql://manyfold:${MANYFOLD_DB_PASSWORD}@manyfold-db:3306/manyfold
+      REDIS_URL: redis://manyfold-redis:6379
+      SECRET_KEY_BASE: ${MANYFOLD_SECRET}
+      MULTIUSER: enabled
+      REGISTRATION: disabled
+
+  # Redis server used by Manyfold
+  # Runs on port 6379
+  manyfold-redis:
+    container_name: manyfold-redis
+    image: redis:latest
+    restart: always
+    networks:
+      - network_manyfold
+    environment:
+      PUID: ${UID_MANYFOLD}
+      PGID: ${GID_MANYFOLD}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Database server used by Manyfold
+  # Runs on port 3306
+  manyfold-db:
+    container_name: manyfold-db
+    image: mariadb:latest
+    restart: always
+    volumes:
+      - ${INFRA_DIR}/db_manyfold:/var/lib/mysql
+    networks:
+      - network_manyfold
+    environment:
+      MARIADB_DATABASE: manyfold
+      MARIADB_USER: manyfold
+      MARIADB_PASSWORD: ${MANYFOLD_DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MANYFOLD_DB_ROOT_PASSWORD}
+      PUID: ${UID_MANYFOLD}
+      PGID: ${GID_MANYFOLD}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Grafana server, used to visualize data from Prometheus
+  # Runs on port 3000
+  grafana:
+    container_name: grafana
+    image: grafana/grafana
+    restart: always
+    depends_on:
+      - proxy
+      - prometheus
+    networks:
+      - network_grafana
+      - network_proxy
+    environment:
+      PUID: ${UID_GRAFANA}
+      PGID: ${GID_GRAFANA}
+      TZ: ${INFRA_TIMEZONE}
+      GF_SERVER_ROOT_URL: "https://${DOMAIN_GRAFANA}"
+      GF_USERS_ALLOW_SIGN_UP: false
+
+  # Jellyfin server, open to family and friends
+  # Runs on port 8096
+  jellyfin:
+    container_name: jellyfin
+    image: jellyfin/jellyfin
+    restart: 'always'
+    depends_on:
+      - proxy
+    volumes:
+      - ${INFRA_DIR}/jellyfin/cache:/cache
+      - ${INFRA_DIR}/jellyfin/config:/config
+      - ${INFRA_DIR}/Movies:/films:ro
+      - ${INFRA_DIR}/Shows:/series:ro
+    networks:
+      - network_proxy
+    environment:
+      PUID: ${UID_JELLYFIN}
+      PGID: ${GID_JELLYFIN}
+      TZ: ${INFRA_TIMEZONE}
+      JELLYFIN_PublishedServerUrl: "https://${DOMAIN_JELLYFIN}"
+
+  # Proxy monitoring
+  # Listens on 7880
+  goaccess:
+    image: 'xavierh/goaccess-for-nginxproxymanager:latest'
+    container_name: goaccess
+    restart: always
+    depends_on:
+      - proxy
+    networks:
+      - network_proxy
+    environment:
+      - PUID=${UID_GOACCESS}
+      - PGID=${GID_GOACCESS}
+      - TZ=${INFRA_TIMEZONE}
+      - SKIP_ARCHIVED_LOGS=False #optional
+      - DEBUG=False #optional
+      - BASIC_AUTH=True #optional
+      - BASIC_AUTH_USERNAME=${GOACCESS_USER} #optional
+      - BASIC_AUTH_PASSWORD=${GOACCESS_PASSWORD} #optional
+      - EXCLUDE_IPS=127.0.0.1 #optional - comma delimited
+      - LOG_TYPE=NPM #optional - more information below
+      - ENABLE_BROWSERS_LIST=True #optional - more information below
+      - CUSTOM_BROWSERS=Kuma:Uptime,TestBrowser:Crawler #optional - comma delimited, more information below
+      - HTML_REFRESH=1 #optional - Refresh the HTML report every X seconds. https://goaccess.io/man
+      - KEEP_LAST=30 #optional - Keep the last specified number of days in storage. https://goaccess.io/man
+      - PROCESSING_THREADS=1
+    volumes:
+      - ${INFRA_DIR}/proxy/data/logs:/opt/log
+
+  # Nginx Proxy Manager, used to manage reverse proxies
+  proxy:
+    container_name: proxy
+    image: 'jc21/nginx-proxy-manager:latest'
+    restart: always
+    depends_on:
+      - proxy-db
+    ports:
+      - '80:80' # Public HTTP Port
+      - '443:443' # Public HTTPS Port
+      - '81:81' # Admin Web Port
+    volumes:
+      - ${INFRA_DIR}/proxy/data:/data
+      - ${INFRA_DIR}/proxy/letsencrypt:/etc/letsencrypt
+    networks:
+      - network_proxy
+      - network_proxy_private
+    environment:
+      PUID: ${UID_PROXY}
+      PGID: ${GID_PROXY}
+      TZ: ${INFRA_TIMEZONE}
+      DB_MYSQL_HOST: "proxy-db"
+      DB_MYSQL_PORT: 3306
+      DB_MYSQL_USER: "npm"
+      DB_MYSQL_PASSWORD: ${PROXY_DB_PASSWORD}
+      DB_MYSQL_NAME: "npm"
+      DISABLE_IPV6: 'true'
+
+  # Database used by Nginx Proxy Manager
+  # Runs on port 3306
+  proxy-db:
+    container_name: proxy-db
+    image: 'jc21/mariadb-aria:latest'
+    restart: always
+    networks:
+      - network_proxy_private
+    volumes:
+      - ${INFRA_DIR}/db_proxy:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PROXY_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: 'npm'
+      MYSQL_USER: 'npm'
+      MYSQL_PASSWORD: ${PROXY_DB_PASSWORD}
+      MARIADB_AUTO_UPGRADE: '1'
+      PUID: ${UID_PROXY}
+      PGID: ${GID_PROXY}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Redis server used by Paperless-NGX
+  # Runs on port 6379
+  paperless-broker:
+    container_name: paperless-broker
+    image: docker.io/library/redis:7
+    restart: always
+    networks:
+      - network_paperless
+    environment:
+      PUID: ${UID_PAPERLESS}
+      PGID: ${GID_PAPERLESS}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Database server used by Paperless-NGX
+  # Runs on port 3306
+  paperless-db:
+    container_name: paperless-db
+    image: docker.io/library/mariadb:10
+    restart: always
+    networks:
+      - network_paperless
+    volumes:
+      - ${INFRA_DIR}/db_paperless:/var/lib/mysql
+    environment:
+      MARIADB_HOST: paperless
+      MARIADB_DATABASE: paperless
+      MARIADB_USER: paperless
+      MARIADB_PASSWORD: ${PAPERLESS_DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${PAPERLESS_DB_ROOT_PASSWORD}
+      PUID: ${UID_PAPERLESS}
+      PGID: ${GID_PAPERLESS}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Paperless-NGX, used to manage documents
+  # Runs on port 8000
+  paperless:
+    container_name: paperless-ngx
+    image: ghcr.io/paperless-ngx/paperless-ngx:latest
+    restart: always
+    depends_on:
+      - paperless-broker
+      - paperless-db
+      - proxy
+    networks:
+      - network_proxy
+      - network_paperless
+    volumes:
+      - ${INFRA_DIR}/paperless/data:/usr/src/paperless/data
+      - ${INFRA_DIR}/paperless/media:/usr/src/paperless/media
+      - ${INFRA_DIR}/paperless/export:/usr/src/paperless/export
+      - ${INFRA_DIR}/paperless/consume:/usr/src/paperless/consume
+    environment:
+      USERMAP_UID: ${UID_PAPERLESS}
+      USERMAP_GID: ${GID_PAPERLESS}
+      PAPERLESS_SECRET_KEY: ${PAPERLESS_SECRET}
+      PAPERLESS_URL: https://${DOMAIN_PAPERLESS}
+      PAPERLESS_TIME_ZONE: ${INFRA_TIMEZONE}
+      PAPERLESS_OCR_LANGUAGE: eng
+      PAPERLESS_REDIS: redis://paperless-broker:6379
+      PAPERLESS_DBHOST: paperless-db
+      PAPERLESS_DBPORT: 3306
+      PAPERLESS_DBENGINE: mariadb
+      PAPERLESS_ADMIN_USER: ${PAPERLESS_USER}
+      PAPERLESS_ADMIN_PASSWORD: ${PAPERLESS_PASSWORD}
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS: ${PAPERLESS_DB_PASSWORD}
+      PUID: ${UID_PAPERLESS}
+      PGID: ${GID_PAPERLESS}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Personal dashboard
+  # Listens on 80 and 443
+  heimdall:
+    container_name: heimdall
+    image: lscr.io/linuxserver/heimdall:latest
+    restart: always
+    depends_on:
+      - proxy
+    networks:
+      - network_proxy
+    environment:
+      PUID: ${UID_HEIMDALL}
+      PGID: ${GID_HEIMDALL}
+      TZ: ${INFRA_TIMEZONE}
+    volumes:
+      - ${INFRA_DIR}/heimdall:/config
+
+  # Hedgedoc, a collaborative note taking app
+  # Listens on 80/443
+  hedgedoc:
+    container_name: hedgedoc
+    image: quay.io/hedgedoc/hedgedoc:latest
+    restart: always
+    depends_on:
+      - hedgedoc-db
+      - proxy
+    networks:
+      - network_proxy
+      - network_hedgedoc
+    environment:
+      CMD_DB_URL: "mysql://hedgedoc:${HEDGEDOC_DB_PASSWORD}@hedgedoc-db:3306/hedgedoc"
+      CMD_DOMAIN: ${DOMAIN_HEDGEDOC}
+      CMD_ALLOW_EMAIL_REGISTER: false
+      CMD_URL_ADDPORT: false
+      CMD_PROTOCOL_USESSL: true
+      CMD_ALLOW_ORIGIN: 'proxy'
+      PUID: ${UID_HEDGEDOC}
+      PGID: ${GID_HEDGEDOC}
+      TZ: ${INFRA_TIMEZONE}
+    volumes:
+      - ${INFRA_DIR}/hedgedoc:/config
+
+  # Hedgedoc database
+  # Listens on 3006
+  hedgedoc-db:
+    container_name: hedgedoc-db
+    image: mariadb
+    restart: always
+    networks:
+      - network_hedgedoc
+    volumes:
+      - ${INFRA_DIR}/db_hedgedoc:/var/lib/mysql
+    environment:
+      MARIADB_DATABASE: hedgedoc
+      MARIADB_USER: hedgedoc
+      MARIADB_PASSWORD: ${HEDGEDOC_DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${HEDGEDOC_DB_ROOT_PASSWORD}
+      PUID: ${UID_HEDGEDOC}
+      PGID: ${GID_HEDGEDOC}
+      TZ: ${INFRA_TIMEZONE}
+
+  # Privatebin
+  # Listens on 8080
+  privatebin:
+    container_name: privatebin
+    image: privatebin/nginx-fpm-alpine:latest
+    restart: always
+    depends_on:
+      - proxy
+    read_only: true
+    networks:
+      - network_proxy
+    environment:
+      PUID: ${UID_PRIVATEBIN}
+      PGID: ${GID_PRIVATEBIN}
+      TZ: ${INFRA_TIMEZONE}
